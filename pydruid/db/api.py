@@ -143,7 +143,7 @@ class Connection(object):
         msq_netloc = "{host}:{port}".format(host=host, port=8888)
         self.sql_native_url = parse.urlunparse((scheme, netloc, path, None, None, None))
         self.msq_engine_url = parse.urlunparse(
-            (scheme, msq_netloc, None, None, None, None)
+            (scheme, msq_netloc, "", None, None, None)
         )
         self.context = context or {}
         self.closed = False
