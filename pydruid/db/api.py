@@ -129,8 +129,7 @@ class Connection(object):
         self,
         host="localhost",
         port=8082,
-        sql_native_path="/druid/v2/sql/",
-        msq_engine_path="",
+        path="/druid/v2/sql/",
         scheme="http",
         user=None,
         password=None,
@@ -141,11 +140,10 @@ class Connection(object):
         proxies=None,
     ):
         netloc = "{host}:{port}".format(host=host, port=port)
-        self.sql_native_url = parse.urlunparse(
-            (scheme, netloc, sql_native_path, None, None, None)
-        )
+        msq_netloc = "{host}:{port}".format(host=host, port=8888)
+        self.sql_native_url = parse.urlunparse((scheme, netloc, path, None, None, None))
         self.msq_engine_url = parse.urlunparse(
-            (scheme, netloc, msq_engine_path, None, None, None)
+            (scheme, msq_netloc, None, None, None, None)
         )
         self.context = context or {}
         self.closed = False
