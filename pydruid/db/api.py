@@ -25,7 +25,7 @@ class Type(object):
 def connect(
     host="localhost",
     port=8082,
-    sql_native_path="/druid/v2/sql/",
+    path="/druid/v2/sql/",
     scheme="http",
     user=None,
     password=None,
@@ -47,7 +47,7 @@ def connect(
     return Connection(
         host=host,
         port=port,
-        sql_native_path=sql_native_path,
+        path=path,
         scheme=scheme,
         user=user,
         password=password,
