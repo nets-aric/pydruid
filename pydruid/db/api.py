@@ -2,10 +2,18 @@ import itertools
 import json
 from collections import namedtuple, OrderedDict
 from urllib import parse
-
+import time
 import requests
 
 from pydruid.db import exceptions
+from pydruid.db.msq_engine_functions import (
+    TaskNotRunningException,
+    get_msq_query_status,
+    get_msq_result,
+    get_msq_error_response,
+    cancel_msq_query,
+    TaskFailedException,
+)
 
 
 class Type(object):
@@ -17,7 +25,7 @@ class Type(object):
 def connect(
     host="localhost",
     port=8082,
-    path="/druid/v2/sql/",
+    sql_native_path="/druid/v2/sql/",
     scheme="http",
     user=None,
     password=None,
@@ -37,17 +45,17 @@ def connect(
     context = context or {}
 
     return Connection(
-        host,
-        port,
-        path,
-        scheme,
-        user,
-        password,
-        context,
-        header,
-        ssl_verify_cert,
-        ssl_client_cert,
-        proxies,
+        host=host,
+        port=port,
+        sql_native_path=sql_native_path,
+        scheme=scheme,
+        user=user,
+        password=password,
+        context=context,
+        header=header,
+        ssl_verify_cert=ssl_verify_cert,
+        ssl_client_cert=ssl_client_cert,
+        proxies=proxies,
     )
 
 
@@ -121,7 +129,8 @@ class Connection(object):
         self,
         host="localhost",
         port=8082,
-        path="/druid/v2/sql/",
+        sql_native_path="/druid/v2/sql/",
+        msq_engine_path="",
         scheme="http",
         user=None,
         password=None,
@@ -132,7 +141,12 @@ class Connection(object):
         proxies=None,
     ):
         netloc = "{host}:{port}".format(host=host, port=port)
-        self.url = parse.urlunparse((scheme, netloc, path, None, None, None))
+        self.sql_native_url = parse.urlunparse(
+            (scheme, netloc, sql_native_path, None, None, None)
+        )
+        self.msq_engine_url = parse.urlunparse(
+            (scheme, netloc, msq_engine_path, None, None, None)
+        )
         self.context = context or {}
         self.closed = False
         self.cursors = []
@@ -167,7 +181,8 @@ class Connection(object):
         """Return a new Cursor Object using the connection."""
 
         cursor = Cursor(
-            self.url,
+            self.sql_native_url,
+            self.msq_engine_url,
             self.user,
             self.password,
             self.context,
@@ -198,7 +213,8 @@ class Cursor(object):
 
     def __init__(
         self,
-        url,
+        sql_native_url,
+        msq_engine_url,
         user=None,
         password=None,
         context=None,
@@ -207,7 +223,8 @@ class Cursor(object):
         proxies=None,
         ssl_client_cert=None,
     ):
-        self.url = url
+        self.sql_native_url = sql_native_url
+        self.msq_engine_url = msq_engine_url
         self.context = context or {}
         self.header = header
         self.user = user
@@ -247,18 +264,24 @@ class Cursor(object):
     @check_closed
     def execute(self, operation, parameters=None):
         query = apply_parameters(operation, parameters)
-        results = self._stream_query(query)
 
-        # `_stream_query` returns a generator that produces the rows; we need to
-        # consume the first row so that `description` is properly set, so let's
-        # consume it and insert it back if it is not the header.
-        try:
-            first_row = next(results)
-            self._results = (
-                results if self.header else itertools.chain([first_row], results)
-            )
-        except StopIteration:
-            self._results = iter([])
+        if self.context.get("msq_engine", False) is True:
+            self.context.pop("msq_engine", None)
+            results = self._stream_query_msq_engine(query)
+            self._results = results
+        else:
+            results = self._stream_query_sql_native(query)
+
+            # `_stream_query` returns a generator that produces the rows; we need to
+            # consume the first row so that `description` is properly set, so let's
+            # consume it and insert it back if it is not the header.
+            try:
+                first_row = next(results)
+                self._results = (
+                    results if self.header else itertools.chain([first_row], results)
+                )
+            except StopIteration:
+                self._results = iter([])
 
         return self
 
@@ -321,7 +344,7 @@ class Cursor(object):
 
     next = __next__
 
-    def _stream_query(self, query):
+    def _stream_query_sql_native(self, query):
         """
         Stream rows from a query.
 
@@ -338,7 +361,7 @@ class Cursor(object):
             requests.auth.HTTPBasicAuth(self.user, self.password) if self.user else None
         )
         r = requests.post(
-            self.url,
+            url=self.sql_native_url,
             stream=True,
             headers=headers,
             json=payload,
@@ -382,6 +405,110 @@ class Cursor(object):
             if Row is None:
                 Row = namedtuple("Row", row.keys(), rename=True)
             yield Row(*row.values())
+
+    def _stream_query_msq_engine(self, query):
+        """
+        Stream rows from a query.
+
+        This method will yield rows as the data is returned in chunks from the
+        server.
+        """
+        self.description = None
+
+        headers = {"Content-Type": "application/json"}
+
+        payload = {"query": query, "context": self.context, "header": self.header}
+
+        auth = (
+            requests.auth.HTTPBasicAuth(self.user, self.password) if self.user else None
+        )
+
+        url = f"{self.msq_engine_url}/druid/v2/sql/task/"
+
+        r = requests.post(
+            url=url,
+            stream=True,
+            headers=headers,
+            data=json.dumps(payload),
+            auth=auth,
+            verify=self.ssl_verify_cert,
+            cert=self.ssl_client_cert,
+            proxies=self.proxies,
+        )
+        if r.encoding is None:
+            r.encoding = "utf-8"
+        # raise any error messages
+        if r.status_code != 202:
+            try:
+                payload = r.json()
+            except Exception:
+                payload = {
+                    "error": "Unknown error",
+                    "errorClass": "Unknown",
+                    "errorMessage": r.text,
+                }
+
+            category = payload.pop("category", payload.pop("errorClass", "Unknown"))
+            msg = "{error} ({category}): {errorMessage}".format(
+                **payload, category=category
+            )
+            raise exceptions.ProgrammingError(msg)
+
+        task_id = r.json()["taskId"]
+
+        if r.json()["state"] != "RUNNING":
+            raise TaskNotRunningException(
+                f"Task {task_id} did not start. Please retry your query."
+            )
+        try:
+            while True:
+                status = get_msq_query_status(
+                    druid_base_url=self.msq_engine_url, task_id=task_id
+                )
+                if status == "RUNNING":
+                    time.sleep(1)
+                elif status == "SUCCESS":
+                    result = get_msq_result(
+                        druid_base_url=self.msq_engine_url, task_id=task_id
+                    )
+                    break
+                elif status == "FAILED":
+                    raise TaskFailedException(
+                        get_msq_error_response(
+                            druid_base_url=self.msq_engine_url, task_id=task_id
+                        )
+                    )
+        except TaskFailedException as err:
+            cancel_msq_query(druid_base_url=self.msq_engine_url, task_id=task_id)
+            raise err
+        except KeyboardInterrupt as err:
+            cancel_msq_query(druid_base_url=self.msq_engine_url, task_id=task_id)
+            raise err
+        except Exception as err:
+            cancel_msq_query(druid_base_url=self.msq_engine_url, task_id=task_id)
+            raise err
+
+        Row = None
+        for row in msq_rows(result):
+            # update description
+            if self.description is None:
+                self.description = (
+                    list(row.items()) if self.header else get_description_from_row(row)
+                )
+
+            # return row in namedtuple
+            if Row is None:
+                Row = namedtuple("Row", row.keys(), rename=True)
+            yield Row(*row.values())
+
+
+def msq_rows(res: dict):
+    for row in res["results"]:
+        temp_dict = {}
+        for sig, value in zip(res["signature"], row):
+            temp_dict[sig.get("name")] = value
+
+        yield OrderedDict(temp_dict)
 
 
 def rows_from_chunks(chunks):
